@@ -43,13 +43,13 @@ type Post = {
 };
 type Comment = { id: number; post_id: number; name: string; message: string; created_at: string };
 type Reaction = { id: number; post_id: number; reaction: string };
-type Profile = {
+type ProfileInfo = {
   name: string;
   tagline: string;
   networks: string | null;
   current_city: string | null;
-  avatar_url: string | null;
 };
+type Profile = ProfileInfo & { avatar_url: string | null };
 
 const DEFAULT_PROFILE: Profile = {
   name: "Michael",
@@ -99,8 +99,27 @@ async function uploadFile(file: File, folder: string) {
   return supabase.storage.from("media").getPublicUrl(path).data.publicUrl;
 }
 
+// Turns a chosen file into a temporary link the browser can preview
+function useObjectUrl(file: File | null) {
+  const [url, setUrl] = useState("");
+  useEffect(() => {
+    if (!file) {
+      setUrl("");
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl); // clean up the old link
+  }, [file]);
+  return url;
+}
+
 const inputClass =
   "w-full border border-[#bdc7d8] p-1 text-[12px] focus:border-[#3b5998] focus:outline-none";
+const grayButton =
+  "border border-[#999] bg-[#f2f2f2] px-3 py-[3px] hover:bg-[#e6e6e6] disabled:cursor-not-allowed disabled:opacity-60";
+const blueButton =
+  "border border-[#29447e] bg-[#5b74a8] px-3 py-[3px] font-bold text-white hover:bg-[#4f6899] disabled:cursor-not-allowed disabled:opacity-60";
 
 export default function Home() {
   // Data from Supabase
@@ -113,25 +132,49 @@ export default function Home() {
   const [loading, setLoading] = useState(true); // first load only
   const [loadError, setLoadError] = useState("");
   const [actionError, setActionError] = useState("");
+  const [toast, setToast] = useState(""); // small "done!" message
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   // New post box
   const [message, setMessage] = useState("");
   const [mediaFile, setMediaFile] = useState<File | null>(null);
+  const [previewReady, setPreviewReady] = useState(false); // true once the preview has fully loaded
   const [sending, setSending] = useState(false);
   const [shareError, setShareError] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaPreview = useObjectUrl(mediaFile);
 
-  // Profile editing
+  // Profile
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({ name: "", tagline: "", networks: "", city: "" });
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarReady, setAvatarReady] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileError, setProfileError] = useState("");
+  const avatarInputRef = useRef<HTMLInputElement>(null);
+  const avatarPreview = useObjectUrl(avatarFile);
+  const avatarSrc = avatarPreview || profile.avatar_url; // show the preview first, if there is one
 
   // Reactions and comments UI
   const [pickerFor, setPickerFor] = useState<number | null>(null); // which post has the emoji popup open
   const [openComments, setOpenComments] = useState<Record<number, boolean>>({});
   const [drafts, setDrafts] = useState<Record<number, string>>({});
+
+  // Share only works when there is text and, if media is attached, its preview has finished loading
+  const canShare = !sending && message.trim().length > 0 && (!mediaFile || previewReady);
+  const shareHint =
+    mediaFile && !previewReady
+      ? "Waiting for the preview to finish..."
+      : mediaFile && !message.trim()
+        ? "Add a message to share your media."
+        : "";
+
+  // ---------- Small UI helpers ----------
+  function showToast(text: string) {
+    clearTimeout(toastTimer.current);
+    setToast(text);
+    toastTimer.current = setTimeout(() => setToast(""), 2200);
+  }
 
   // ---------- Load everything ----------
   async function loadAll() {
@@ -170,7 +213,18 @@ export default function Home() {
       return;
     }
     setShareError("");
+    setPreviewReady(false); // wait for the new preview to load
     setMediaFile(file);
+  }
+
+  function removeMedia() {
+    setMediaFile(null);
+    setPreviewReady(false);
+  }
+
+  function previewFailed() {
+    setShareError("Couldn't preview that file. Try a different one.");
+    removeMedia();
   }
 
   async function handleShare() {
@@ -199,7 +253,8 @@ export default function Home() {
       if (error) throw error;
 
       setMessage("");
-      setMediaFile(null);
+      removeMedia();
+      showToast("✓ Posted to your Wall");
       await loadAll();
     } catch {
       setShareError("Couldn't share your post. Try again in a moment.");
@@ -215,25 +270,31 @@ export default function Home() {
       networks: profile.networks ?? "",
       city: profile.current_city ?? "",
     });
-    setAvatarFile(null);
     setProfileError("");
     setEditing(true);
   }
 
   function pickAvatar(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) return;
     const problem = checkFile(file, true);
     if (problem) {
       setProfileError(problem);
-      e.target.value = "";
       return;
     }
     setProfileError("");
+    setAvatarReady(false); // wait for the new preview to load
     setAvatarFile(file);
   }
 
-  async function saveProfile() {
+  function cancelPhoto() {
+    setAvatarFile(null);
+    setAvatarReady(false);
+  }
+
+  // Saves the profile by inserting a NEW row (visitors can only insert, never update or delete)
+  async function saveProfileRow(info: ProfileInfo) {
     setSavingProfile(true);
     setProfileError("");
 
@@ -241,26 +302,41 @@ export default function Home() {
       let avatar_url = profile.avatar_url;
       if (avatarFile) avatar_url = await uploadFile(avatarFile, "avatars");
 
-      // Insert a NEW row each time (visitors can't update or delete, only insert)
-      const { error } = await supabase.from("profiles").insert({
-        name: form.name.trim() || "Michael",
-        tagline: form.tagline.trim(),
-        networks: form.networks.trim() || null,
-        current_city: form.city.trim() || null,
-        avatar_url,
-      });
+      const { error } = await supabase.from("profiles").insert({ ...info, avatar_url });
       if (error) throw error;
 
+      cancelPhoto();
       setEditing(false);
+      showToast("✓ Profile saved");
       await loadAll();
     } catch {
-      setProfileError("Couldn't save your info. Try again in a moment.");
+      setProfileError("Couldn't save your profile. Try again in a moment.");
     }
     setSavingProfile(false);
   }
 
+  // "Save photo" button: keep the text as it is, change only the photo
+  function savePhoto() {
+    saveProfileRow({
+      name: profile.name,
+      tagline: profile.tagline,
+      networks: profile.networks,
+      current_city: profile.current_city,
+    });
+  }
+
+  // "Save" button in the Edit info form
+  function saveInfo() {
+    saveProfileRow({
+      name: form.name.trim() || "Michael",
+      tagline: form.tagline.trim(),
+      networks: form.networks.trim() || null,
+      current_city: form.city.trim() || null,
+    });
+  }
+
   // ---------- Reactions and comments ----------
-  async function react(postId: number, reaction: string) {
+  async function react(postId: number, reaction: string, emoji: string) {
     setPickerFor(null);
     setActionError("");
     const { error } = await supabase.from("reactions").insert({ post_id: postId, reaction });
@@ -268,6 +344,7 @@ export default function Home() {
       setActionError("Couldn't save your reaction. Try again.");
       return;
     }
+    showToast(`✓ You reacted ${emoji}`);
     await loadAll();
   }
 
@@ -288,6 +365,7 @@ export default function Home() {
       return;
     }
     setDrafts((d) => ({ ...d, [postId]: "" }));
+    showToast("✓ Comment posted");
     await loadAll();
   }
 
@@ -297,7 +375,7 @@ export default function Home() {
       className="min-h-screen bg-[#e9e9e9] text-[12px] text-[#333]"
       style={{ fontFamily: "Tahoma, 'Lucida Grande', Verdana, sans-serif" }}
     >
-      {/* Animations: new posts slide in, the emoji popup pops */}
+      {/* Animations: posts slide in, popups pop, and every button gets a "pressed" effect */}
       <style>{`
         @keyframes slidein {
           from { opacity: 0; transform: translateY(-12px); }
@@ -306,6 +384,14 @@ export default function Home() {
         @keyframes pop {
           from { opacity: 0; transform: scale(0.8); }
           to   { opacity: 1; transform: scale(1); }
+        }
+        button {
+          transition: transform 0.1s, scale 0.1s, filter 0.1s, box-shadow 0.1s;
+        }
+        button:active:not(:disabled) {
+          transform: scale(0.92);
+          filter: brightness(0.8);
+          box-shadow: 0 0 0 3px rgba(59, 89, 152, 0.35);
         }
       `}</style>
 
@@ -322,19 +408,63 @@ export default function Home() {
         <div className="flex flex-col border border-[#ccc] bg-white md:flex-row">
           {/* ---------- Left sidebar: profile ---------- */}
           <aside className="w-full shrink-0 border-b border-[#ccc] p-4 md:w-[220px] md:border-b-0 md:border-r">
-            {/* Avatar frame */}
+            {/* Avatar frame (shows a preview as soon as you choose a photo) */}
             <div className="flex aspect-square w-full max-w-[220px] items-center justify-center overflow-hidden border border-[#ccc] bg-[#d8dfea] text-[64px] font-bold text-[#3b5998]">
-              {profile.avatar_url ? (
+              {avatarSrc ? (
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
-                  src={profile.avatar_url}
+                  key={avatarSrc}
+                  src={avatarSrc}
                   alt={`${profile.name}'s profile photo`}
+                  onLoad={() => {
+                    if (avatarPreview) setAvatarReady(true);
+                  }}
+                  onError={() => {
+                    if (avatarPreview) {
+                      setProfileError("Couldn't preview that photo. Try a different one.");
+                      cancelPhoto();
+                    }
+                  }}
                   className="h-full w-full object-cover"
                 />
               ) : (
                 profile.name.charAt(0)
               )}
             </div>
+
+            {/* Upload button right under the photo */}
+            <input
+              ref={avatarInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/gif,image/webp"
+              onChange={pickAvatar}
+              className="hidden"
+            />
+            {avatarFile ? (
+              <div className="mt-2 max-w-[220px]">
+                <div className="flex gap-2">
+                  <button
+                    onClick={savePhoto}
+                    disabled={savingProfile || !avatarReady}
+                    className={blueButton}
+                  >
+                    {savingProfile ? "Saving..." : avatarReady ? "Save photo" : "Loading..."}
+                  </button>
+                  <button onClick={cancelPhoto} disabled={savingProfile} className={grayButton}>
+                    Cancel
+                  </button>
+                </div>
+                <p className="mt-1 text-[11px] text-[#777]">Preview only. Not saved yet.</p>
+              </div>
+            ) : (
+              <button
+                onClick={() => avatarInputRef.current?.click()}
+                className={`mt-2 w-full max-w-[220px] ${grayButton}`}
+              >
+                📷 Change photo
+              </button>
+            )}
+            {profileError && <p className="mt-1 text-[11px] text-[#cc0000]">{profileError}</p>}
 
             {editing ? (
               <div className="mt-3 space-y-2">
@@ -374,28 +504,14 @@ export default function Home() {
                     className={inputClass}
                   />
                 </label>
-                <label className="block">
-                  <span className="font-bold">Profile photo</span>
-                  <input
-                    type="file"
-                    accept="image/jpeg,image/png,image/gif,image/webp"
-                    onChange={pickAvatar}
-                    className="w-full text-[11px]"
-                  />
-                </label>
-                {profileError && <p className="text-[11px] text-[#cc0000]">{profileError}</p>}
                 <div className="flex gap-2">
-                  <button
-                    onClick={saveProfile}
-                    disabled={savingProfile}
-                    className="border border-[#29447e] bg-[#5b74a8] px-3 py-[3px] font-bold text-white hover:bg-[#4f6899] disabled:opacity-60"
-                  >
+                  <button onClick={saveInfo} disabled={savingProfile} className={blueButton}>
                     {savingProfile ? "Saving..." : "Save"}
                   </button>
                   <button
                     onClick={() => setEditing(false)}
                     disabled={savingProfile}
-                    className="border border-[#999] bg-[#f2f2f2] px-3 py-[3px] hover:bg-[#e6e6e6]"
+                    className={grayButton}
                   >
                     Cancel
                   </button>
@@ -405,10 +521,7 @@ export default function Home() {
               <>
                 <h2 className="mt-3 text-[18px] font-bold">{profile.name}</h2>
                 <p className="text-[#777]">{profile.tagline}</p>
-                <button
-                  onClick={startEdit}
-                  className="mt-3 border border-[#999] bg-[#f2f2f2] px-3 py-[3px] hover:bg-[#e6e6e6]"
-                >
+                <button onClick={startEdit} className={`mt-3 ${grayButton}`}>
                   Edit info
                 </button>
                 {profile.networks && (
@@ -446,6 +559,42 @@ export default function Home() {
               {MAX - message.length} characters remaining
             </div>
 
+            {/* Preview of the photo/video you picked */}
+            {mediaFile && mediaPreview && (
+              <div className="mt-2 inline-block max-w-full border border-[#ccc] bg-[#f7f7f7] p-2">
+                {mediaFile.type.startsWith("video/") ? (
+                  <video
+                    key={mediaPreview}
+                    src={mediaPreview}
+                    controls
+                    muted
+                    onLoadedData={() => setPreviewReady(true)}
+                    onError={previewFailed}
+                    className="max-h-[200px] max-w-full"
+                  />
+                ) : (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    key={mediaPreview}
+                    src={mediaPreview}
+                    alt="Preview of the photo you are sharing"
+                    onLoad={() => setPreviewReady(true)}
+                    onError={previewFailed}
+                    className="max-h-[200px] max-w-full"
+                  />
+                )}
+                <div className="mt-1 flex items-center gap-2 text-[11px] text-[#555]">
+                  <span className="max-w-[200px] truncate">{mediaFile.name}</span>
+                  <span className={previewReady ? "text-[#2e7d32]" : ""}>
+                    {previewReady ? "✓ Ready" : "Loading preview..."}
+                  </span>
+                  <button onClick={removeMedia} className="text-[#cc0000] underline">
+                    remove
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="mt-2 flex flex-wrap items-center gap-2">
               {/* Hidden file input, opened by the button below */}
               <input
@@ -458,24 +607,14 @@ export default function Home() {
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                className="border border-[#999] bg-[#f2f2f2] px-3 py-[3px] hover:bg-[#e6e6e6]"
+                disabled={sending}
+                className={grayButton}
               >
                 📎 Photo / Video
               </button>
-              {mediaFile && (
-                <span className="text-[11px] text-[#555]">
-                  {mediaFile.name}{" "}
-                  <button onClick={() => setMediaFile(null)} className="text-[#cc0000] underline">
-                    remove
-                  </button>
-                </span>
-              )}
               <span className="text-[11px] text-[#cc0000]">{shareError}</span>
-              <button
-                onClick={handleShare}
-                disabled={sending || !message.trim()}
-                className="ml-auto border border-[#29447e] bg-[#5b74a8] px-4 py-[3px] font-bold text-white hover:bg-[#4f6899] disabled:cursor-not-allowed disabled:opacity-60"
-              >
+              {!shareError && <span className="text-[11px] text-[#777]">{shareHint}</span>}
+              <button onClick={handleShare} disabled={!canShare} className={`ml-auto px-4 ${blueButton}`}>
                 {sending ? "Sharing..." : "Share"}
               </button>
             </div>
@@ -571,9 +710,9 @@ export default function Home() {
                             {REACTIONS.map((r) => (
                               <button
                                 key={r.key}
-                                onClick={() => react(post.id, r.key)}
+                                onClick={() => react(post.id, r.key, r.emoji)}
                                 title={r.label}
-                                className="text-[22px] transition-transform hover:scale-125"
+                                className="text-[22px] hover:scale-125"
                               >
                                 {r.emoji}
                               </button>
@@ -614,7 +753,7 @@ export default function Home() {
                           />
                           <button
                             onClick={() => addComment(post.id)}
-                            className="shrink-0 border border-[#29447e] bg-[#5b74a8] px-3 font-bold text-white hover:bg-[#4f6899]"
+                            className={`shrink-0 ${blueButton}`}
                           >
                             Comment
                           </button>
@@ -628,6 +767,16 @@ export default function Home() {
           </section>
         </div>
       </main>
+
+      {/* "Done!" message after an action succeeds */}
+      {toast && (
+        <div
+          role="status"
+          className="fixed bottom-4 right-4 z-50 animate-[pop_0.2s_ease-out] border border-[#3b5998] bg-white px-3 py-2 font-bold text-[#3b5998] shadow-md"
+        >
+          {toast}
+        </div>
+      )}
     </div>
   );
 }
