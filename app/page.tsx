@@ -161,12 +161,13 @@ export default function Home() {
   const [drafts, setDrafts] = useState<Record<number, string>>({});
 
   // Share only works when there is text and, if media is attached, its preview has finished loading
-  const canShare = !sending && message.trim().length > 0 && (!mediaFile || previewReady);
+  const hasContent = message.trim().length > 0 || !!mediaFile;
+  const canShare = !sending && hasContent && (!mediaFile || previewReady);
   const shareHint =
     mediaFile && !previewReady
       ? "Waiting for the preview to finish..."
       : mediaFile && !message.trim()
-        ? "Add a message to share your media."
+        ? "Message is optional. You can share the media on its own."
         : "";
 
   // ---------- Small UI helpers ----------
@@ -229,8 +230,8 @@ export default function Home() {
 
   async function handleShare() {
     const text = message.trim();
-    if (!text) {
-      setShareError("Write something first!");
+    if (!text && !mediaFile) {
+      setShareError("Write something or add a photo/video first!");
       return;
     }
 
@@ -666,7 +667,9 @@ export default function Home() {
                       </span>
                     </div>
 
-                    <p className="mt-1 whitespace-pre-wrap break-words">{post.message}</p>
+                    {post.message && (
+                      <p className="mt-1 whitespace-pre-wrap break-words">{post.message}</p>
+                    )}
 
                     {/* Photo or video */}
                     {post.image_url && post.media_type === "video" && (
