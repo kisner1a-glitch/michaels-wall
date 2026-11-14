@@ -257,8 +257,12 @@ export default function Home() {
       removeMedia();
       showToast("✓ Posted to your Wall");
       await loadAll();
-    } catch {
-      setShareError("Couldn't share your post. Try again in a moment.");
+    } catch (err) {
+      console.error("Share failed:", err);
+      const reason = (err as { message?: string })?.message;
+      setShareError(
+        reason ? `Couldn't share: ${reason}` : "Couldn't share your post. Try again in a moment."
+      );
     }
     setSending(false);
   }
@@ -584,6 +588,13 @@ export default function Home() {
                     className="max-h-[200px] max-w-full"
                   />
                 )}
+                <input
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  maxLength={MAX}
+                  placeholder="Add a caption (optional)..."
+                  className={`mt-2 ${inputClass}`}
+                />
                 <div className="mt-1 flex items-center gap-2 text-[11px] text-[#555]">
                   <span className="max-w-[200px] truncate">{mediaFile.name}</span>
                   <span className={previewReady ? "text-[#2e7d32]" : ""}>
@@ -613,7 +624,7 @@ export default function Home() {
               >
                 📎 Photo / Video
               </button>
-              <span className="text-[11px] text-[#cc0000]">{shareError}</span>
+              <span className="basis-full text-[11px] text-[#cc0000] sm:basis-auto">{shareError}</span>
               {!shareError && <span className="text-[11px] text-[#777]">{shareHint}</span>}
               <button onClick={handleShare} disabled={!canShare} className={`ml-auto px-4 ${blueButton}`}>
                 {sending ? "Sharing..." : "Share"}
